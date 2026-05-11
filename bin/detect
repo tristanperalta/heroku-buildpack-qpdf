@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+
+# Users explicitly add this buildpack, so always match.
+echo "qpdf"
+exit 0

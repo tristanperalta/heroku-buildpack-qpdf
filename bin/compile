@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+BUILD_DIR=$1
+CACHE_DIR=$2
+ENV_DIR=$3
+
+DEFAULT_QPDF_VERSION="12.3.2"
+QPDF_BASE_URL="https://github.com/qpdf/qpdf/releases/download"
+
+if [ -f "$ENV_DIR/QPDF_VERSION" ]; then
+  QPDF_VERSION=$(cat "$ENV_DIR/QPDF_VERSION" | tr -d '[:space:]')
+else
+  QPDF_VERSION="$DEFAULT_QPDF_VERSION"
+fi
+
+ARCH=$(uname -m)
+if [ "$ARCH" != "x86_64" ]; then
+  echo "  !     Unsupported architecture: $ARCH (qpdf buildpack only ships x86_64 binaries)" >&2
+  exit 1
+fi
+
+ARCHIVE_NAME="qpdf-${QPDF_VERSION}-bin-linux-x86_64"
+DOWNLOAD_URL="${QPDF_BASE_URL}/v${QPDF_VERSION}/${ARCHIVE_NAME}.zip"
+
+CACHE_VERSION_FILE="$CACHE_DIR/qpdf-version"
+CACHED_DIR="$CACHE_DIR/qpdf"
+
+if [ -f "$CACHE_VERSION_FILE" ] && [ "$(cat "$CACHE_VERSION_FILE")" = "$QPDF_VERSION" ] && [ -d "$CACHED_DIR" ]; then
+  echo "-----> Using cached qpdf v${QPDF_VERSION}"
+else
+  echo "-----> Downloading qpdf v${QPDF_VERSION} for x86_64..."
+
+  rm -rf "$CACHED_DIR" "$CACHE_VERSION_FILE"
+  mkdir -p "$CACHED_DIR"
+
+  curl -sSfL "$DOWNLOAD_URL" -o "$CACHE_DIR/${ARCHIVE_NAME}.zip" || {
+    echo "  !     Failed to download qpdf v${QPDF_VERSION}" >&2
+    echo "  !     URL: $DOWNLOAD_URL" >&2
+    exit 1
+  }
+
+  unzip -q "$CACHE_DIR/${ARCHIVE_NAME}.zip" -d "$CACHED_DIR"
+
+  rm -f "$CACHE_DIR/${ARCHIVE_NAME}.zip"
+
+  echo "$QPDF_VERSION" > "$CACHE_VERSION_FILE"
+  echo "-----> qpdf v${QPDF_VERSION} downloaded successfully"
+fi
+
+mkdir -p "$BUILD_DIR/.heroku/bin" "$BUILD_DIR/.heroku/lib"
+cp -a "$CACHED_DIR/bin/." "$BUILD_DIR/.heroku/bin/"
+cp -a "$CACHED_DIR/lib/." "$BUILD_DIR/.heroku/lib/"
+chmod +x "$BUILD_DIR/.heroku/bin/"*
+
+mkdir -p "$BUILD_DIR/.profile.d"
+cat > "$BUILD_DIR/.profile.d/qpdf.sh" <<'EOF'
+export PATH="$PATH:/app/.heroku/bin"
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}/app/.heroku/lib"
+EOF
+
+echo "-----> qpdf v${QPDF_VERSION} installed"
