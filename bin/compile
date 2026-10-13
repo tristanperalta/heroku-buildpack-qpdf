@@ -6,46 +6,87 @@ BUILD_DIR=$1
 CACHE_DIR=$2
 ENV_DIR=$3
 
-DEFAULT_QPDF_VERSION="12.3.2"
+DEFAULT_QPDF_VERSION="12.4.2"
 QPDF_BASE_URL="https://github.com/qpdf/qpdf/releases/download"
+SUPPORTED_STACKS="heroku-22 heroku-24 heroku-26"
 
 if [ -f "$ENV_DIR/QPDF_VERSION" ]; then
-  QPDF_VERSION=$(cat "$ENV_DIR/QPDF_VERSION" | tr -d '[:space:]')
+  QPDF_VERSION=$(tr -d '[:space:]' < "$ENV_DIR/QPDF_VERSION")
 else
   QPDF_VERSION="$DEFAULT_QPDF_VERSION"
 fi
 
-ARCH=$(uname -m)
-if [ "$ARCH" != "x86_64" ]; then
-  echo "  !     Unsupported architecture: $ARCH (qpdf buildpack only ships x86_64 binaries)" >&2
-  exit 1
-fi
+STACK="${STACK:-unknown}"
+case " $SUPPORTED_STACKS " in
+  *" $STACK "*) ;;
+  *)
+    echo "  !     Stack '$STACK' has not been tested with this buildpack (tested: $SUPPORTED_STACKS)" >&2
+    echo "  !     Continuing anyway; qpdf's bundled libraries need glibc 2.34 or newer." >&2
+    ;;
+esac
 
-ARCHIVE_NAME="qpdf-${QPDF_VERSION}-bin-linux-x86_64"
+case "$(uname -m)" in
+  x86_64) ARCH="x86_64" ;;
+  aarch64|arm64) ARCH="aarch64" ;;
+  *)
+    echo "  !     Unsupported architecture: $(uname -m) (qpdf publishes x86_64 and aarch64 Linux binaries only)" >&2
+    exit 1
+    ;;
+esac
+
+ARCHIVE_NAME="qpdf-${QPDF_VERSION}-bin-linux-${ARCH}"
 DOWNLOAD_URL="${QPDF_BASE_URL}/v${QPDF_VERSION}/${ARCHIVE_NAME}.zip"
+CHECKSUM_URL="${QPDF_BASE_URL}/v${QPDF_VERSION}/qpdf-${QPDF_VERSION}.sha256"
 
-CACHE_VERSION_FILE="$CACHE_DIR/qpdf-version"
+CACHE_KEY="${QPDF_VERSION}-${ARCH}"
+CACHE_KEY_FILE="$CACHE_DIR/qpdf-cache-key"
 CACHED_DIR="$CACHE_DIR/qpdf"
 
-if [ -f "$CACHE_VERSION_FILE" ] && [ "$(cat "$CACHE_VERSION_FILE")" = "$QPDF_VERSION" ] && [ -d "$CACHED_DIR" ]; then
-  echo "-----> Using cached qpdf v${QPDF_VERSION}"
+if [ -f "$CACHE_KEY_FILE" ] && [ "$(cat "$CACHE_KEY_FILE")" = "$CACHE_KEY" ] && [ -d "$CACHED_DIR/bin" ] && [ -d "$CACHED_DIR/lib" ]; then
+  echo "-----> Using cached qpdf v${QPDF_VERSION} (${ARCH}, stack ${STACK})"
 else
-  echo "-----> Downloading qpdf v${QPDF_VERSION} for x86_64..."
+  echo "-----> Downloading qpdf v${QPDF_VERSION} for ${ARCH} (stack ${STACK})..."
 
-  rm -rf "$CACHED_DIR" "$CACHE_VERSION_FILE"
+  rm -rf "$CACHED_DIR" "$CACHE_KEY_FILE"
   mkdir -p "$CACHED_DIR"
+  TMP_DIR=$(mktemp -d "$CACHE_DIR/qpdf-download.XXXXXX")
+  trap 'rm -rf "$TMP_DIR"' EXIT
 
-  curl -sSfL "$DOWNLOAD_URL" -o "$CACHE_DIR/${ARCHIVE_NAME}.zip" || {
-    echo "  !     Failed to download qpdf v${QPDF_VERSION}" >&2
+  curl -sSfL --retry 3 "$CHECKSUM_URL" -o "$TMP_DIR/qpdf.sha256" || {
+    echo "  !     Failed to download checksum file for qpdf v${QPDF_VERSION}" >&2
+    echo "  !     URL: $CHECKSUM_URL" >&2
+    exit 1
+  }
+
+  # Accept "<hash>  <file>" and "<hash> *<file>" lines, with or without CRLF.
+  EXPECTED_SHA=$(tr -d '\r' < "$TMP_DIR/qpdf.sha256" | awk -v name="${ARCHIVE_NAME}.zip" '
+    { f = $2; sub(/^\*/, "", f); if (f == name) { print $1; exit } }')
+  if [ -z "$EXPECTED_SHA" ]; then
+    echo "  !     qpdf v${QPDF_VERSION} does not publish ${ARCHIVE_NAME}.zip" >&2
+    if [ "$ARCH" = "aarch64" ] && [ "$(printf '%s\n' "12.4.0" "$QPDF_VERSION" | sort -V | head -n1)" != "12.4.0" ]; then
+      echo "  !     aarch64 binaries are only published for qpdf 12.4.0 and newer." >&2
+    fi
+    exit 1
+  fi
+
+  curl -sSfL --retry 3 "$DOWNLOAD_URL" -o "$TMP_DIR/${ARCHIVE_NAME}.zip" || {
+    echo "  !     Failed to download qpdf v${QPDF_VERSION} for ${ARCH}" >&2
     echo "  !     URL: $DOWNLOAD_URL" >&2
     exit 1
   }
 
-  unzip -q "$CACHE_DIR/${ARCHIVE_NAME}.zip" -d "$CACHED_DIR"
+  ACTUAL_SHA=$(sha256sum "$TMP_DIR/${ARCHIVE_NAME}.zip" | awk '{ print $1 }')
+  if [ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]; then
+    echo "  !     Checksum mismatch for ${ARCHIVE_NAME}.zip" >&2
+    echo "  !     expected: $EXPECTED_SHA" >&2
+    echo "  !     actual:   $ACTUAL_SHA" >&2
+    exit 1
+  fi
+  echo "-----> Verified sha256 checksum"
 
-  rm -f "$CACHE_DIR/${ARCHIVE_NAME}.zip"
+  unzip -q "$TMP_DIR/${ARCHIVE_NAME}.zip" -d "$CACHED_DIR"
 
-  echo "$QPDF_VERSION" > "$CACHE_VERSION_FILE"
+  echo "$CACHE_KEY" > "$CACHE_KEY_FILE"
   echo "-----> qpdf v${QPDF_VERSION} downloaded successfully"
 fi
 
